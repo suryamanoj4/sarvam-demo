@@ -1,2 +1,2 @@
-
 reflex==0.10.0
+sarvamai==0.1.37
