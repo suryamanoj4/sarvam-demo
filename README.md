@@ -4,9 +4,10 @@ Scan a page from any book and read it in your language.
 
 Pustakam is a small web app built on Sarvam AI. Point it at a photo of a book page in any Indian language, and it gives you back clean, translated text that can read itself out loud.
 
-1. **Extract** — Sarvam Vision digitises the page (JPG, PNG, TIFF or PDF; several pages at once) and returns the text in reading order.
-2. **Translate** — Sarvam-105B silently fixes OCR noise (broken words, missing matras, split words) and translates the text faithfully into your language, with an optional short summary.
-3. **Listen** — Bulbul v3 narrates the translation. You can also download it as Markdown.
+1. **Extract** — Sarvam Vision digitises the page (JPG, PNG, TIFF or PDF; several pages at once), detects the language, and returns the text in reading order.
+2. **Check and edit** — the extracted text is editable in place, so you can fix anything Vision misread before translating.
+3. **Translate** — Sarvam-105B translates faithfully into your language, with an optional summary and a "simple words" mode for children and elders.
+4. **Listen, copy or download** — Bulbul v3 narrates either the original page or the translation; copy the text, or download it as Markdown.
 
 The uploaded page is streamed to Sarvam in memory, never written to disk, and the app purges its upload cache after every run.
 

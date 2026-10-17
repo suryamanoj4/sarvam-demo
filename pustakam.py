@@ -6,6 +6,7 @@ Run: reflex run
 
 import asyncio
 import base64
+import json
 import mimetypes
 import os
 import shutil
@@ -52,6 +53,7 @@ TARGET_ITEMS = [
 ]
 SOURCE_CODE = {label: code for label, code in SOURCE_ITEMS}
 TARGET_CODE = {label: code for label, code in TARGET_ITEMS}
+LANG_NAME = {code: label for label, code in SOURCE_ITEMS if code != "auto"}
 
 TERMINAL = {"completed", "partially_completed", "failed", "rejected"}
 
@@ -80,8 +82,12 @@ def _digitise(entries: list[tuple[str, bytes]], source_lang: str) -> str:
         timeout=120,
     )
     r.raise_for_status()
+    payload = r.json()
     pages = []
-    for doc in r.json().get("documents") or []:
+    doc_language = ""
+    for doc in payload.get("documents") or []:
+        if not doc_language and doc.get("language"):
+            doc_language = doc["language"]
         for pg in doc.get("pages") or []:
             blocks = sorted(pg.get("blocks") or [], key=lambda b: b.get("reading_order", 0))
             page_text = "\n\n".join(
@@ -92,10 +98,10 @@ def _digitise(entries: list[tuple[str, bytes]], source_lang: str) -> str:
     text = "\n\n".join(pages).strip()
     if not text:
         raise RuntimeError("Vision returned no text")
-    return text
+    return text, doc_language, len(pages)
 
 
-def _translate(text: str, target_name: str) -> str:
+def _translate(text: str, target_name: str, plain: bool = False) -> str:
     system = (
         "You are an expert translator and copy editor for Indian-language books. "
         "You receive OCR text extracted from a scanned book page. "
@@ -103,9 +109,13 @@ def _translate(text: str, target_name: str) -> str:
         f"using context - never change meaning, never add or omit content. "
         f"Then translate the cleaned text faithfully into {target_name}. "
         "Preserve paragraph breaks and headings. Do NOT keep hard line breaks from the scan - "
-        f"reflow them into natural sentences and paragraphs. "
-        f"Output ONLY the translated text in {target_name}, with no commentary or notes."
+        "reflow them into natural sentences and paragraphs. "
     )
+    if plain:
+        system += (
+            "Use simple, everyday words that a child or an elder can follow: short sentences, "
+            "common vocabulary, and keep the full meaning. "
+        )
     r = client.chat.completions(
         model="sarvam-105b",
         messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
@@ -158,6 +168,9 @@ class State(rx.State):
     summary_text: str = ""
     audio_data_uri: str = ""
     preview_uri: str = ""
+    detected_lang: str = ""
+    detected_name: str = ""
+    plain: bool = False
     status1: str = ""
     status2: str = ""
     status3: str = ""
@@ -175,6 +188,14 @@ class State(rx.State):
         self.summarize = value
 
     @rx.event
+    def set_plain(self, value: bool):
+        self.plain = value
+
+    @rx.event
+    def set_extracted(self, value: str):
+        self.extracted_text = value
+
+    @rx.event
     async def extract(self, files: list[rx.UploadFile]):
         if not files:
             self.status1 = "Choose a photo of a page first."
@@ -183,6 +204,8 @@ class State(rx.State):
         self.extracted_text = self.translated_text = self.summary_text = ""
         self.audio_data_uri = ""
         self.preview_uri = ""
+        self.detected_lang = ""
+        self.detected_name = ""
         self.status1 = "Reading the page with Sarvam Vision. This can take up to a minute."
         try:
             entries = [(getattr(f, "name", "") or "page.jpg", await f.read()) for f in files]
@@ -190,9 +213,12 @@ class State(rx.State):
             first_mime = mimetypes.guess_type(first_name)[0] or ""
             if first_mime.startswith("image/") and len(first_data) <= 3_000_000:
                 self.preview_uri = f"data:{first_mime};base64," + base64.b64encode(first_data).decode()
-            text = await asyncio.to_thread(_digitise, entries, SOURCE_CODE[self.source_lang])
+            text, lang, npages = await asyncio.to_thread(_digitise, entries, SOURCE_CODE[self.source_lang])
             self.extracted_text = text
-            self.status1 = f"Read {len(text)} characters. Choose the language you want to read them in."
+            self.detected_lang = lang
+            self.detected_name = LANG_NAME.get(lang, lang)
+            pages_bit = "1 page" if npages <= 1 else f"{npages} pages"
+            self.status1 = f"Read {pages_bit} and {len(text)} characters. Check the text, then choose a language below."
         except Exception as e:
             self.status1 = f"Vision could not read this page. {e}"
         finally:
@@ -208,7 +234,7 @@ class State(rx.State):
         try:
             code = TARGET_CODE[self.target]
             name = TARGETS[code]["name"]
-            self.translated_text = await asyncio.to_thread(_translate, self.extracted_text, name)
+            self.translated_text = await asyncio.to_thread(_translate, self.extracted_text, name, self.plain)
             if self.summarize:
                 self.summary_text = await asyncio.to_thread(_summarize, self.translated_text, name)
             else:
@@ -234,6 +260,31 @@ class State(rx.State):
         finally:
             self.speaking = False
 
+    @rx.event
+    async def speak_original(self):
+        if not self.extracted_text or self.detected_lang not in TARGETS:
+            return
+        self.speaking = True
+        self.status3 = "Recording the original text with Bulbul."
+        try:
+            self.audio_data_uri = await asyncio.to_thread(_speak, self.extracted_text, self.detected_lang)
+            self.status3 = "Original recording ready."
+        except Exception as e:
+            self.status3 = f"Narration failed. {e}"
+        finally:
+            self.speaking = False
+
+    @rx.event
+    def copy_translated(self):
+        if not self.translated_text:
+            return
+        self.status3 = "Copied the translation to the clipboard."
+        return rx.call_script(f"navigator.clipboard.writeText({json.dumps(self.translated_text)})")
+
+    @rx.var
+    def original_available(self) -> bool:
+        return bool(self.extracted_text) and self.detected_lang in TARGETS
+
     @rx.var
     def download_data(self) -> str:
         parts = [self.translated_text]
@@ -247,13 +298,13 @@ class State(rx.State):
 
 
 def panel_label(text: str) -> rx.Component:
-    return rx.text(text, size="2", color_scheme="gray")
+    return rx.text(text, size="2", color="#6B6459")
 
 
 def reading_panel(value) -> rx.Component:
     return rx.box(
         rx.scroll_area(rx.text(value, white_space="pre-wrap"), max_height="320px", width="100%"),
-        background="var(--color-panel-solid)",
+        background="#FFFFFF",
         border="1px solid #E6DFD0",
         border_radius="8px",
         padding="20px",
@@ -274,7 +325,7 @@ def step_header(number: str, title: str) -> rx.Component:
             style={
                 "font_family": "Georgia, serif",
                 "font_size": "22px",
-                "color": "var(--accent-11)",
+                "color": "#3451B2",
                 "line_height": "1",
             },
         ),
@@ -302,7 +353,7 @@ def index() -> rx.Component:
                         rx.text(
                             "Scan a page from any book and read it in your language.",
                             size="4",
-                            color="#7A7266",
+                            color="#6B6459",
                         ),
                         spacing="2",
                         align="start",
@@ -335,7 +386,7 @@ def index() -> rx.Component:
                                     rx.text(
                                         "JPG, PNG, TIFF or PDF. Several pages are fine.",
                                         size="1",
-                                        color_scheme="gray",
+                                        color="#6B6459",
                                     ),
                                     rx.selected_files("page_upload"),
                                     spacing="2",
@@ -362,11 +413,31 @@ def index() -> rx.Component:
                                 spacing="3",
                                 align="center",
                             ),
-                            rx.text(State.status1, size="2", color_scheme="gray"),
+                            rx.text(State.status1, size="2", color="#6B6459"),
                             rx.cond(
                                 State.extracted_text != "",
                                 rx.vstack(
-                                    panel_label("Extracted by Sarvam Vision"),
+                                    rx.hstack(
+                                        panel_label("Extracted by Sarvam Vision"),
+                                        rx.cond(
+                                            State.detected_name != "",
+                                            rx.badge(State.detected_name, variant="soft", color_scheme="gray"),
+                                        ),
+                                        rx.cond(
+                                            State.original_available,
+                                            rx.button(
+                                                rx.icon("volume-2", size=14),
+                                                "Hear original",
+                                                on_click=State.speak_original,
+                                                disabled=State.speaking,
+                                                variant="soft",
+                                                size="1",
+                                            ),
+                                        ),
+                                        spacing="3",
+                                        align="center",
+                                        wrap="wrap",
+                                    ),
                                     rx.flex(
                                         rx.cond(
                                             State.preview_uri != "",
@@ -378,7 +449,22 @@ def index() -> rx.Component:
                                             ),
                                         ),
                                         rx.box(
-                                            reading_panel(State.extracted_text),
+                                            rx.text_area(
+                                                value=State.extracted_text,
+                                                on_change=State.set_extracted,
+                                                min_height="200px",
+                                                width="100%",
+                                                background="#FFFFFF",
+                                                color="#26221D",
+                                                border="1px solid #E6DFD0",
+                                                border_radius="8px",
+                                                padding="16px",
+                                                style={
+                                                    "font_family": "Georgia, 'Times New Roman', serif",
+                                                    "font_size": "15.5px",
+                                                    "line_height": "1.65",
+                                                },
+                                            ),
                                             flex="1",
                                             min_width="280px",
                                         ),
@@ -386,6 +472,11 @@ def index() -> rx.Component:
                                         spacing="4",
                                         align="start",
                                         width="100%",
+                                    ),
+                                    rx.text(
+                                        "Check the text and fix anything Vision misread before translating.",
+                                        size="1",
+                                        color="#6B6459",
                                     ),
                                     spacing="2",
                                     align="start",
@@ -397,6 +488,10 @@ def index() -> rx.Component:
                             width="100%",
                         ),
                         width="100%",
+                        style={
+                            "background": "#FFFFFF",
+                            "border": "1px solid #E6DFD0",
+                        },
                     ),
                     rx.card(
                         rx.vstack(
@@ -419,6 +514,12 @@ def index() -> rx.Component:
                                     on_change=State.set_summarize,
                                     size="3",
                                 ),
+                                rx.checkbox(
+                                    "Explain in simple words",
+                                    checked=State.plain,
+                                    on_change=State.set_plain,
+                                    size="3",
+                                ),
                                 rx.button(
                                     rx.icon("languages", size=16),
                                     "Translate",
@@ -431,7 +532,7 @@ def index() -> rx.Component:
                                 align="center",
                                 wrap="wrap",
                             ),
-                            rx.text(State.status2, size="2", color_scheme="gray"),
+                            rx.text(State.status2, size="2", color="#6B6459"),
                             rx.cond(
                                 State.translated_text != "",
                                 rx.vstack(
@@ -441,6 +542,13 @@ def index() -> rx.Component:
                                             "Read aloud",
                                             on_click=State.speak,
                                             disabled=State.speaking,
+                                            variant="soft",
+                                            size="3",
+                                        ),
+                                        rx.button(
+                                            rx.icon("copy", size=16),
+                                            "Copy text",
+                                            on_click=State.copy_translated,
                                             variant="soft",
                                             size="3",
                                         ),
@@ -458,8 +566,9 @@ def index() -> rx.Component:
                                         rx.spinner(loading=State.speaking),
                                         spacing="3",
                                         align="center",
+                                        wrap="wrap",
                                     ),
-                                    rx.text(State.status3, size="2", color_scheme="gray"),
+                                    rx.text(State.status3, size="2", color="#6B6459"),
                                     rx.cond(
                                         State.audio_data_uri != "",
                                         rx.el.audio(
@@ -495,12 +604,16 @@ def index() -> rx.Component:
                             width="100%",
                         ),
                         width="100%",
+                        style={
+                            "background": "#FFFFFF",
+                            "border": "1px solid #E6DFD0",
+                        },
                     ),
                     rx.box(height="1px", background="#E6DFD0", width="100%"),
                     rx.text(
                         "Pages are read by Sarvam Vision, translated by Sarvam-105B, and narrated by Bulbul v3.",
                         size="1",
-                        color_scheme="gray",
+                        color="#6B6459",
                     ),
                     spacing="5",
                     align="start",
